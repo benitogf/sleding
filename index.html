@@ -1,0 +1,14 @@
+<script>
+  var ws = new WebSocket("ws://localhost:3030/test")
+  ws.onopen = (event) => {
+    console.log("open", event)
+  }
+
+  ws.onclose = (event) => {
+    console.log("close", event)
+  }
+
+  ws.onmessage = (event) => {
+    console.log("msg", event)
+  }
+</script>
