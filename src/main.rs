@@ -4,7 +4,10 @@ use base64::encode;
 use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use warp::ws::{Message, WebSocket};
@@ -20,12 +23,19 @@ struct Object {
     data: String,
 }
 
+/// Our global unique user id counter.
+static NEXT_CONNECTION_ID: AtomicUsize = AtomicUsize::new(1);
+
+// A websocket connection sender
+type Connection = mpsc::UnboundedSender<Result<Message, warp::Error>>;
 // Vector of connections
-type Connections = Vec<mpsc::UnboundedSender<Result<Message, warp::Error>>>;
+type Connections = HashMap<usize, Connection>;
 // Hash map key -> active connections
 type Pool = HashMap<String, Connections>;
 // ??
-type Pools = Arc<Mutex<Pool>>;
+type Pools = Arc<tokio::sync::Mutex<Pool>>;
+//
+type Storage = Arc<Mutex<sled::Db>>;
 
 fn now() -> u128 {
     let start = SystemTime::now();
@@ -39,27 +49,73 @@ fn now() -> u128 {
     }
 }
 
-async fn ws_reader(ws: WebSocket, data: Object) {
-    let (user_ws_tx, mut user_ws_rx) = ws.split();
+async fn ws_reader(ws: WebSocket, key: String, pools: Pools, db: Storage) {
+    let mut data = Object {
+        created: 0,
+        updated: 0,
+        data: "".to_string(),
+    };
+    // https://stackoverflow.com/a/38918024
+    let fkey = &key;
+    let pkey = key.clone();
 
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+
+    if key == "" {
+        // Clock connection
+        info!("subscription to the clock");
+        data = Object {
+            created: 0,
+            updated: 0,
+            data: now().to_string(),
+        };
+    } else {
+        info!("subscription on {}!", key);
+        let result = db.lock().unwrap().get(fkey).unwrap();
+        if result.is_some() {
+            let raw = &result.unwrap();
+            let serialized = String::from_utf8_lossy(raw);
+            data = serde_json::from_str(&serialized).unwrap();
+        }
+    }
+
+    let (ws_tx, mut ws_rx) = ws.split();
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the websocket...
-    let (_tx, rx) = mpsc::unbounded_channel();
-    tokio::task::spawn(rx.forward(user_ws_tx).map(|result| {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn(rx.forward(ws_tx).map(|result| {
         if let Err(e) = result {
             error!("websocket send error: {}", e);
+            // https://github.com/rust-lang/rust/issues/62290
+            // TODO: remove connection from pool on disconnect
+            // let mut pools = pools.lock().await;
+            // let pool = pools.get_mut(&pkey).unwrap();
+            // pool.remove(&connection_id);
         }
     }));
 
     let j = serde_json::to_string(&data);
-    _tx.send(Ok(Message::text(j.unwrap()))).ok();
+    tx.send(Ok(Message::text(j.unwrap()))).ok();
+    info!("handshake {} sent", key);
 
-    // TODO: add connection to the corresponding pool
-    while let Some(result) = user_ws_rx.next().await {
+    // add connection to the corresponding pool
+    let mut mpools = pools.lock().await;
+    if !mpools.contains_key(fkey) {
+        // create the pool for the key if it doesn't exists
+        let mut new_pool = Connections::default();
+        new_pool.insert(connection_id, tx);
+        mpools.insert(key, new_pool);
+    } else {
+        let pool = mpools.get_mut(&key).unwrap();
+        pool.insert(connection_id, tx);
+    }
+
+    info!("pool {}", mpools.get(&pkey).unwrap().len());
+
+    while let Some(result) = ws_rx.next().await {
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
-                // TODO: remove connection on disconnect
                 eprintln!("websocket error: {}", e);
                 break;
             }
@@ -69,7 +125,7 @@ async fn ws_reader(ws: WebSocket, data: Object) {
     }
 }
 
-fn storage() -> Arc<Mutex<sled::Db>> {
+fn storage() -> Storage {
     // Database
     let db = sled::open("db").unwrap();
     let test = Object {
@@ -94,64 +150,48 @@ fn storage() -> Arc<Mutex<sled::Db>> {
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
-
-    let db = storage();
     // pool
     // Keep track of connections, key is usize, value
     // is a websocket sender.
-    let pools: Pools = Arc::new(Mutex::new(Pool::new()));
+    let pools: Pools = Arc::new(tokio::sync::Mutex::new(Pool::new()));
 
     // https://users.rust-lang.org/t/why-closure-outlives-variables-owned-by-main/16725
-    // even if the variable is Arc<Mutex> you need to clone?
-    let subscription_pools = pools.clone();
-    let rest_db = db.clone();
+    // even if the variable is Arc<Mutex> you need to clone
+    // let subscription_pools = pools.clone();
+    let _db = storage();
+    let _rest_db = _db.clone();
+    // Turn our "state" into a new Filter...
+    let subscription_pools = warp::any().map(move || pools.clone());
+    let subscription_db = warp::any().map(move || _db.clone());
+    let rest_db = warp::any().map(move || _rest_db.clone());
 
     // routes
     let subscription = warp::path::param()
         // The `ws()` filter will prepare the Websocket handshake.
         .and(warp::ws())
-        .map(move |key: String, ws: warp::ws::Ws| {
-            let mut data = Object {
-                created: 0,
-                updated: 0,
-                data: "".to_string(),
-            };
-            if key == "" {
-                // Clock connection
-                info!("subscription to the clock");
-                data = Object {
-                    created: 0,
-                    updated: 0,
-                    data: now().to_string(),
-                };
-            } else {
-                info!("subscription on {}!", key);
-                let result = db.lock().unwrap().get(key).unwrap();
-                if result.is_some() {
-                    let raw = &result.unwrap();
-                    let serialized = String::from_utf8_lossy(raw);
-                    data = serde_json::from_str(&serialized).unwrap();
-                }
-            }
-            info!("pool {}", subscription_pools.lock().unwrap().len());
-            ws.on_upgrade(|websocket| ws_reader(websocket, data))
+        .and(subscription_pools)
+        .and(subscription_db)
+        .map(|key: String, ws: warp::ws::Ws, pools: Pools, db: Storage| {
+            ws.on_upgrade(move |websocket| ws_reader(websocket, key, pools, db))
         });
 
-    let rest = warp::path::param().map(move |key: String| {
-        let result = rest_db.lock().unwrap().get(key).unwrap();
-        if result.is_some() {
-            let raw = &result.unwrap();
-            let serialized = String::from_utf8_lossy(raw);
-            let deserialized: Object = serde_json::from_str(&serialized).unwrap();
-            warp::reply::json(&deserialized)
-        } else {
-            warp::reply::json(&Object {
-                created: 0,
-                updated: 0,
-                data: "".to_string(),
-            })
-        }
-    });
+    let rest = warp::path::param()
+        .and(rest_db)
+        .map(|key: String, db: Storage| {
+            let result = db.lock().unwrap().get(key).unwrap();
+            if result.is_some() {
+                let raw = &result.unwrap();
+                let serialized = String::from_utf8_lossy(raw);
+                let deserialized: Object = serde_json::from_str(&serialized).unwrap();
+                warp::reply::json(&deserialized)
+            } else {
+                warp::reply::json(&Object {
+                    created: 0,
+                    updated: 0,
+                    data: "".to_string(),
+                })
+            }
+        });
 
     let keys = warp::any().map(|| format!("TODO: get keys from db"));
 
