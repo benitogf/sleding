@@ -160,10 +160,12 @@ async fn main() {
     // let subscription_pools = pools.clone();
     let _db = storage();
     let _rest_db = _db.clone();
+    let _keys_db = _db.clone();
     // Turn our "state" into a new Filter...
     let subscription_pools = warp::any().map(move || pools.clone());
     let subscription_db = warp::any().map(move || _db.clone());
     let rest_db = warp::any().map(move || _rest_db.clone());
+    let keys_db = warp::any().map(move || _keys_db.clone());
 
     // routes
     let subscription = warp::path::param()
@@ -193,7 +195,25 @@ async fn main() {
             }
         });
 
-    let keys = warp::any().map(|| format!("TODO: get keys from db"));
+    let keys = warp::any().and(keys_db).map(|db: Storage| {
+        // iterating over keys https://github.com/spacejam/sled/blob/master/tests/test_tree.rs#L306
+        let mut result = db.lock().unwrap().iter().keys();
+        let mut keys: Vec<String> = vec![];
+        loop {
+            let _k = match result.next() {
+                Some(_content) => {
+                    info!("sled iterating");
+                    let raw = &_content.unwrap();
+                    let serialized = String::from_utf8_lossy(raw);
+                    keys.push(serialized.to_string());
+                }
+                None => {
+                    break;
+                }
+            };
+        }
+        warp::reply::json(&keys)
+    });
 
     let routes = subscription.or(rest).or(keys);
 
