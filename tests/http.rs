@@ -1,7 +1,34 @@
-use assert_cmd::prelude::*; // Add methods on commands
-use predicates::prelude::*;
-use std::io::Write;
-use std::process::Command; // Run programs // Used for writing assertions
+use hyper::body::HttpBody;
+use hyper::Client;
+use tokio::time::delay_for;
+use tokio::time::Duration;
 
-#[test]
-fn startServer() -> Result<(), Box<dyn std::error::Error>> {}
+#[tokio::test]
+async fn start_server() {
+  tokio::spawn(async move { sleding::run().await });
+  delay_for(Duration::from_millis(600)).await;
+}
+
+#[tokio::test]
+async fn test_route() {
+  let client = Client::new();
+  let uri = "http://localhost:3030/test".parse().unwrap();
+  let mut resp = client.get(uri).await.unwrap();
+  println!("Response test: {}", resp.status());
+  assert_eq!(resp.status(), 200);
+  while let Some(chunk) = resp.body_mut().data().await {
+    println!("{:?}", &chunk.unwrap())
+  }
+}
+
+#[tokio::test]
+async fn root_route() {
+  let client = Client::new();
+  let uri = "http://localhost:3030".parse().unwrap();
+  let mut resp = client.get(uri).await.unwrap();
+  println!("Response root: {}", resp.status());
+  assert_eq!(resp.status(), 200);
+  while let Some(chunk) = resp.body_mut().data().await {
+    println!("{:?}", &chunk.unwrap())
+  }
+}
