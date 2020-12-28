@@ -1,14 +1,36 @@
 <script>
-  var ws = new WebSocket("ws://localhost:3030/test")
-  ws.onopen = (event) => {
-    console.log("open", event)
+  const binaryStringToString = (buf) => {
+    const dataView = new DataView(buf)
+    const decoder = new TextDecoder('utf8')
+    return decoder.decode(dataView)
   }
 
-  ws.onclose = (event) => {
-    console.log("close", event)
+  const binaryStringToInt = (buf) => parseInt(binaryStringToString(buf))
+
+  var ws = new WebSocket("ws://localhost:3030")
+  ws.binaryType = "arraybuffer"
+  ws.onopen = () => {
+    console.log("clock open")
+  }
+
+  ws.onclose = () => {
+    console.log("clock close")
   }
 
   ws.onmessage = (event) => {
-    console.log("msg", event)
+    console.log("clock msg", binaryStringToInt(event.data))
+  }
+
+  var ws2 = new WebSocket("ws://localhost:3030/test")
+  ws2.onopen = () => {
+    console.log("test open")
+  }
+
+  ws2.onclose = () => {
+    console.log("test close")
+  }
+
+  ws2.onmessage = (event) => {
+    console.log("test msg", event.data)
   }
 </script>
