@@ -1,5 +1,6 @@
 <script>
   const binaryStringToString = (buf) => {
+    console.log("buf", buf)
     const dataView = new DataView(buf)
     const decoder = new TextDecoder('utf8')
     return decoder.decode(dataView)
@@ -32,5 +33,18 @@
 
   ws2.onmessage = (event) => {
     console.log("test msg", event.data)
+  }
+
+  var ws3 = new WebSocket("ws://localhost:3030/tests/*")
+  ws3.onopen = () => {
+    console.log("test open")
+  }
+
+  ws3.onclose = () => {
+    console.log("test close")
+  }
+
+  ws3.onmessage = (event) => {
+    console.log("tests msg", event.data)
   }
 </script>
