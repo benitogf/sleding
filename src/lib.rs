@@ -10,12 +10,14 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio::time::delay_for;
+use tokio::time::sleep;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio::time::Duration;
 use warp::ws::{Message, WebSocket};
 use warp::{http, Filter};
 use regex::Regex;
 use lazy_static::lazy_static;
+use warp::Reply;
 
 #[macro_use]
 extern crate log;
@@ -34,9 +36,8 @@ struct WriteMessage {
 }
 
 lazy_static! {
-  static ref RE: Regex = Regex::new(r#"^[a-zA-Z\*\d]$|^[a-zA-Z\*\d][a-zA-Z\*\d/]+[a-zA-Z\*\d]$"#).unwrap();
-  static ref RE2: Regex = Regex::new(r"^([^/]*)(.*)$").unwrap();
-  static ref RE3: Regex = Regex::new(r"/+").unwrap();
+  static ref RE_PATH: Regex = Regex::new(r#"^[a-zA-Z\*\d]$|^[a-zA-Z\*\d][a-zA-Z\*\d/]+[a-zA-Z\*\d]$"#).unwrap();
+  static ref RE_CONSECUTIVE_SLASH: Regex = Regex::new(r"/+").unwrap();
 }
 
 // Global unique user id counter
@@ -64,16 +65,13 @@ fn rem_first_char(value: &str) -> &str {
   chars.as_str()
 }
 
+// remove the consecutive repeated separators in a path
 fn clean_path(path: &str) -> String {
-  // Match with two groups, first group is "http://", "https:// or the
-  // beginning characters until the first slash, second group is the rest.
-  let caps = RE2.captures(path).unwrap();
-  // match one or more slashes
-  caps[1].to_string() + &RE3.replace_all(&caps[2], "/")
+  (&RE_CONSECUTIVE_SLASH.replace_all(path, "/")).to_string()
 }
 
 pub fn key_valid(key: &str) -> bool {
-  return key.matches("*").count() < 2 && clean_path(key) == *key && RE.is_match(key)
+  return key.matches("*").count() < 2 && clean_path(key) == *key && RE_PATH.is_match(key)
 }
 
 pub fn key_match(key: String, fkey: String) -> bool {
@@ -91,48 +89,8 @@ async fn clock_writer(pools: Pools) {
       connection.send(Ok(Message::binary(now().to_string()))).ok();
     }
     drop(mpools);
-    delay_for(Duration::from_millis(1000)).await;
+    sleep(Duration::from_millis(1000)).await;
   }
-}
-
-async fn clock_reader(ws: WebSocket, pools: Pools) {
-  let key = "".to_string();
-  let pkey = key.clone();
-  let exit_key = key.clone();
-  let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-
-  info!("subscription to the clock");
-
-  let (ws_tx, mut ws_rx) = ws.split();
-  // Use an unbounded channel to handle buffering and flushing of messages
-  // to the websocket...
-  let (tx, rx) = mpsc::unbounded_channel();
-  tokio::task::spawn(rx.forward(ws_tx));
-  tx.send(Ok(Message::binary(now().to_string()))).ok();
-  info!("clock handshake sent");
-
-  // add connection to the corresponding pool
-  let mut mpools = pools.lock().await;
-  let pool = mpools.get_mut(&pkey).unwrap();
-  pool.insert(connection_id, tx);
-  info!("clock pool size {}", mpools.get(&pkey).unwrap().len());
-  // drop the lock before entering the connection read block
-  drop(mpools);
-
-  while let Some(result) = ws_rx.next().await {
-    let _msg = match result {
-      Ok(msg) => msg,
-      Err(e) => {
-        warn!("websocket error: {}", e);
-        break;
-      }
-    };
-  }
-
-  info!("leaving clock {:?}", connection_id);
-  let mut pools = pools.lock().await;
-  let pool = pools.get_mut(&exit_key).unwrap();
-  pool.remove(&connection_id);
 }
 
 async fn ws_reader(ws: WebSocket, key: String, pools: Pools, db: Storage) {
@@ -147,6 +105,7 @@ async fn ws_reader(ws: WebSocket, key: String, pools: Pools, db: Storage) {
   // Use an unbounded channel to handle buffering and flushing of messages
   // to the websocket...
   let (tx, rx) = mpsc::unbounded_channel();
+  let rx = UnboundedReceiverStream::new(rx);
   tokio::task::spawn(rx.forward(ws_tx));
   // handshake applies to non-clock subscriptions
   if key != "" {
@@ -157,6 +116,8 @@ async fn ws_reader(ws: WebSocket, key: String, pools: Pools, db: Storage) {
     info!("handshake of \"{}\" sent", key);
   } else {
     info!("subscription to clock");
+    tx.send(Ok(Message::binary(now().to_string()))).ok();
+    info!("clock handshake sent");
   }
 
   // add connection to the corresponding pool
@@ -364,7 +325,6 @@ pub async fn run() {
   // Turn our "state" into a new Filter...
   let subscription_pools = warp::any().map(move || _subscription_pools.clone());
   let rest_write_pools = warp::any().map(move || _rest_pools.clone());
-  let clock_pools = warp::any().map(move || _clock_pools.clone());
 
   // routes
   let subscription = warp::path::full()
@@ -373,13 +333,14 @@ pub async fn run() {
     .and(subscription_db)
     .map(|full_path: warp::path::FullPath, ws: warp::ws::Ws, pools: Pools, db: Storage| {
       let key = String::from(rem_first_char(full_path.as_str()));
-      ws.on_upgrade(move |websocket| ws_reader(websocket, key, pools, db))
-    });
-
-  let clock = warp::ws()
-    .and(clock_pools)
-    .map(|ws: warp::ws::Ws, pools: Pools| {
-      ws.on_upgrade(move |websocket| clock_reader(websocket, pools))
+      if key_valid(&key) {
+        ws.on_upgrade(move |websocket| ws_reader(websocket, key, pools, db)).into_response()
+      } else {
+        let obj: WriteMessage = WriteMessage{
+          data: String::from("invalid key"),
+        };
+        warp::reply::with_status(warp::reply::json(&obj), http::StatusCode::BAD_REQUEST).into_response()
+      }
     });
 
   let read =
@@ -417,7 +378,7 @@ pub async fn run() {
     .and(rest_write_pools)
     .and_then(_write);
 
-  let routes = subscription.or(clock).or(write).or(read);
+  let routes = subscription.or(write).or(read);
 
   tokio::spawn(async { clock_writer(pools).await });
   warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
